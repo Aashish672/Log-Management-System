@@ -13,7 +13,7 @@ class TemplateParser:
     for compression and indexing.
     """
 
-    def init(self):
+    def __init__(self):
         # template_dict maps template_id → {"template": str, "count": int}
         self.template_dict: Dict[str, Dict[str, Any]] = defaultdict(
             lambda: {"template": "", "count": 0}

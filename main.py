@@ -1,28 +1,19 @@
+# main.py
+
 from fastapi import FastAPI
-from app.api.endpoints import logs
+from app.api.endpoints.logs import router as log_router
 
-# ----------------------------
-# Initialize FastAPI App
-# ----------------------------
-
-app=FastAPI(
-    title="Cloud Log Management System - Ingestion Layer",
-    version="1.0.0",
+app = FastAPI(
+    title="Cloud Log Management System – Ingestion, Template Extraction & Compression",
+    version="1.2.0",
     description="""
-    This API handles real-time and batch log ingestion.
-    Logs can be forwarded to message queues, databases, or 
-    analytics pipelines for further processing.""",
-    )
+    Cloud-hosted API that ingests logs, extracts recurring templates, 
+    and compresses data blocks using template-based columnar compression.
+    """,
+)
 
-# ---------------------------
-# include Log Router
-# ---------------------------
+app.include_router(log_router, prefix="/logs", tags=["Log Pipeline"])
 
-app.include_router(logs.router,prefix="/logs",tags=["Log Ingestion"])
-
-#-----------------------------
-# Health check Route
-# ----------------------------
 @app.get("/")
 async def root():
-    return {"message":"Log Ingestion Layer is running"}
+    return {"message": "Log Management Pipeline is running 🚀"}
