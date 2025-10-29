@@ -18,8 +18,8 @@ app.include_router(log_router, prefix="/logs", tags=["Log Pipeline"])
 @app.on_event("startup")
 async def startup_event():
     # Print MongoDB URI and database
-    print("🧠 Connected to:", settings.MONGODB_URI)
-    print("🗄️ Using database:", settings.DB_NAME)
+    print("🧠 Connected to MONGODB",)
+    print("🗄️ Using database")
     # Test MongoDB connection
     try:
         result = await db.command("ping")
