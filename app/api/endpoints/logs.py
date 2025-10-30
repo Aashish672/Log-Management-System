@@ -17,6 +17,7 @@ from app.core.database import logs_collection, templates_collection, compressed_
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# Create ONE parser instance to share in memory
 parser = TemplateParser()
 compressor = CompressionModule()
 
@@ -60,6 +61,7 @@ async def ingest_log(log_entry: LogEntry):
         await logs_collection.insert_one(enriched_log)
 
         # 3. Atomically update the template count
+        # This uses the template_id as the MongoDB primary key (_id)
         await templates_collection.update_one(
             {"_id": parsed["template_id"]},
             {
@@ -115,6 +117,7 @@ async def ingest_log_batch(log_entries: List[LogEntry]):
             await logs_collection.insert_many(parsed_batch)
 
         # 3. Store all new compressed blocks
+        # Use insert_many, not update_one in a loop
         blocks_to_insert = [block for block in compressed_blocks.values()]
         if blocks_to_insert:
             await compressed_collection.insert_many(blocks_to_insert)
@@ -124,7 +127,7 @@ async def ingest_log_batch(log_entries: List[LogEntry]):
         for t_id, data in template_updates.items():
             bulk_operations.append(
                 UpdateOne(
-                    {"_id": t_id},
+                    {"_id": t_id}, # Use _id for MongoDB
                     {
                         "$set": {"template_string": data["template_string"]},
                         "$inc": {"frequency": data["count"]}
@@ -136,7 +139,7 @@ async def ingest_log_batch(log_entries: List[LogEntry]):
         if bulk_operations:
             await templates_collection.bulk_write(bulk_operations)
 
-        logger.info(f"✅ Stored batch of {len(parsed_batch)} logs and {len(compressed_blocks)} blocks.")
+        logger.info(f"✅ StBored batch of {len(parsed_batch)} logs and {len(compressed_blocks)} blocks.")
 
         return {
             "status": "success",
