@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import pymongo
 import datetime
-import altair as alt
 import plotly.express as px
 
 from app.core.config import settings
@@ -62,6 +61,7 @@ templates_collection = db["templates"]
 compressed_collection = db["compressed_blocks"]
 logs_collection = db["logs"]
 anomalies_collection = db["anomalies"]
+incidents_collection = db["incidents"]  
 
 # --------------------------------------------------
 # 3. DATA FUNCTIONS
@@ -107,7 +107,6 @@ def get_blocks(template_id):
 def get_anomalies():
     return list(anomalies_collection.find().sort("last_detected", -1))
 
-# ---------- Module 3.5 ----------
 @st.cache_data(ttl=5)
 def search_logs(keyword, limit=100):
     query = {
@@ -119,8 +118,35 @@ def search_logs(keyword, limit=100):
     }
     return list(logs_collection.find(query).sort("timestamp", -1).limit(limit))
 
+@st.cache_data(ttl=10)
+def get_anomaly_heatmap_data(hours=24):
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=hours)
+
+    anomalies = list(anomalies_collection.find({
+        "last_detected": {"$gte": cutoff}
+    }))
+
+    if not anomalies:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(anomalies)
+    df["time_bucket"] = pd.to_datetime(df["last_detected"]).dt.floor("H")
+
+    severity_map = {
+        "MEDIUM": 1,
+        "HIGH": 2,
+        "CRITICAL": 3
+    }
+    df["severity_level"] = df["severity"].map(severity_map).fillna(0)
+
+    return df
+
+@st.cache_data(ttl=10)
+def get_active_incidents():
+    return list(incidents_collection.find().sort("last_updated", -1))
+
 # --------------------------------------------------
-# 4. EXECUTIVE METRICS (FROM CODE-1)
+# 4. EXECUTIVE METRICS
 # --------------------------------------------------
 stats = get_system_stats()
 m1, m2, m3, m4 = st.columns(4)
@@ -136,29 +162,47 @@ st.divider()
 # 5. TABBED DASHBOARD
 # --------------------------------------------------
 tab1, tab2, tab3, tab4 = st.tabs([
-    "🚨 Analytics & Alerts (Module 6)",
-    "🔍 Hybrid Query Engine (3.5)",
-    "🛠 Template & Block Explorer",
-    "📊 Visualization (3.7)"
+    "🚨 Anomalies & Severity (Module 6)",
+    "🔍 Hybrid Query Engine",
+    "🛠 System Explorer",
+    "📊 Incidents & Analytics"
 ])
+
 
 # ==================================================
 # TAB 1 — MODULE 6: ANOMALY DETECTION
 # ==================================================
 with tab1:
+    st.subheader("🚨 Active Anomaly Alerts")
+
     anomalies = get_anomalies()
 
     if not anomalies:
         st.success("System Healthy — No anomalies detected.")
     else:
-        st.error(f"{len(anomalies)} anomalous templates detected")
+        df = pd.DataFrame(anomalies)
 
-        for a in anomalies[:5]:
-            with st.expander(f"⚠️ {a.get('template_string', 'Unknown')}"):
-                st.write(f"**Explanation:** {a.get('explanation')}")
-                st.metric("Frequency", a.get("frequency", 0))
-                st.metric("Anomaly Score", f"{float(a.get('anomaly_score', 0)):.4f}")
-                st.caption(f"Last Detected: {a.get('last_detected')}")
+        severity_filter = st.multiselect(
+            "Filter by Severity",
+            ["CRITICAL", "HIGH", "MEDIUM"],
+            default=["CRITICAL", "HIGH"]
+        )
+
+        # Filter if the dataframe is not empty
+        if not df.empty:
+            df = df[df["severity"].isin(severity_filter)]
+
+            for _, alert in df.iterrows():
+                sev = alert["severity"]
+                icon = "🔴" if sev == "CRITICAL" else ("🟠" if sev == "HIGH" else "🟡")
+
+                with st.expander(f"{icon} {sev} — {alert['template_string']}"):
+                    st.write(f"**Explanation:** {alert['explanation']}")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Frequency", alert["frequency"])
+                    c2.metric("Recent (1h)", alert.get("recent_frequency", 0))
+                    c3.metric("Anomaly Score", f"{alert['anomaly_score']:.4f}")
+                    st.caption(f"Last Detected: {alert['last_detected']}")
 
 # ==================================================
 # TAB 2 — MODULE 3.5: HYBRID QUERY ENGINE
@@ -215,45 +259,118 @@ with tab3:
             c4.metric("Compressed Size", f"{b['compressed_size_bytes']} B")
 
             with st.expander("Decompressed Parameters"):
-                data = compressor.decompress_block(b["compressed_params_hex"])
-                st.json(data)
+                hex_data = b.get("compressed_params_hex")
+                if hex_data:
+                    try:
+                        data = compressor.decompress_block(hex_data)
+                        st.json(data)
+                    except Exception as e:
+                        st.error(f"Decompression Error: {e}")
+                else:
+                    st.warning("No compressed data found in this block (Key 'compressed_params_hex' missing).")
+                    st.write("Raw block data:", b)
 
 # ==================================================
-# TAB 4 — MODULE 3.7: VISUALIZATION
+# TAB 4 — MODULE 3.7: VISUALIZATION & ANALYTICS
 # ==================================================
 with tab4:
-    st.subheader("Log Analytics & Trends")
+    st.subheader("🔥 Anomaly Severity Heatmap (Last 24 Hours)")
 
+    heatmap_df = get_anomaly_heatmap_data(24)
+
+    if heatmap_df.empty:
+        st.info("No recent anomalies to visualize.")
+    else:
+        pivot = heatmap_df.pivot_table(
+            index="template_string",
+            columns="time_bucket",
+            values="severity_level",
+            aggfunc="max",
+            fill_value=0
+        )
+
+        fig = px.imshow(
+            pivot,
+            aspect="auto",
+            color_continuous_scale=[
+                [0, "#E8F5E9"],  # 0: None
+                [0.33, "#FFF59D"], # 1: MEDIUM
+                [0.66, "#FFB74D"], # 2: HIGH
+                [1.0, "#FF7043"]   # 3: CRITICAL
+            ],
+            labels={
+                "x": "Time",
+                "y": "Log Template",
+                "color": "Severity Level"
+            }
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    st.subheader("📌 Correlated Incidents")
+
+    incidents = get_active_incidents()
+
+    if not incidents:
+        st.success("No active incidents detected.")
+    else:
+        for inc in incidents:
+            sev_icon = "🔴" if inc["severity"] == "CRITICAL" else "🟠"
+
+            with st.expander(f"{sev_icon} {inc['severity']} — {inc.get('title', 'Incident')}"):
+                st.write(f"**Status:** {inc.get('status', 'Unknown')}")
+                st.write(f"**Anomaly Count:** {inc.get('anomaly_count', 0)}")
+                st.caption(f"Last Updated: {inc.get('last_updated')}")
+
+                st.write("### Associated Anomalies")
+                anoms = inc.get("anomalies", [])
+                if anoms:
+                    st.dataframe(
+                        pd.DataFrame(anoms)[
+                            ["template_string", "severity", "score", "timestamp"]
+                        ],
+                        use_container_width=True
+                    )
+
+    st.divider()
+    st.subheader("📈 Global Log Analytics")
+    
     days = st.selectbox("Time Window", [1, 7, 30], index=1)
     cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
 
-    df = pd.DataFrame(
-        list(logs_collection.find({"timestamp": {"$gte": cutoff}}))
+    # Fetch logs for analytics (limit to prevent memory issues)
+    df_logs = pd.DataFrame(
+        list(logs_collection.find({"timestamp": {"$gte": cutoff}}).limit(5000))
     )
 
-    if df.empty:
-        st.info("No logs available")
+    if df_logs.empty:
+        st.info("No logs available for analytics in this window.")
     else:
         col1, col2 = st.columns(2)
 
         with col1:
-            sev = df["severity"].value_counts().reset_index()
+            st.markdown("**Logs by Severity**")
+            sev = df_logs["severity"].value_counts().reset_index()
             sev.columns = ["severity", "count"]
-            fig = px.pie(sev, names="severity", values="count", hole=0.4)
-            st.plotly_chart(fig, use_container_width=True)
+            fig_pie = px.pie(sev, names="severity", values="count", hole=0.4, color_discrete_sequence=px.colors.sequential.RdBu)
+            st.plotly_chart(fig_pie, use_container_width=True)
 
         with col2:
-            svc = df["service_name"].value_counts().head(10).reset_index()
+            st.markdown("**Top Services**")
+            svc = df_logs["service_name"].value_counts().head(10).reset_index()
             svc.columns = ["service", "count"]
-            st.bar_chart(svc, x="service", y="count")
+            fig_bar = px.bar(svc, x="service", y="count", color="count")
+            st.plotly_chart(fig_bar, use_container_width=True)
 
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        ts = df.set_index("timestamp").resample("1H").size().reset_index(name="count")
-
-        st.line_chart(ts, x="timestamp", y="count")
+        st.markdown("**Log Volume Over Time**")
+        df_logs["timestamp"] = pd.to_datetime(df_logs["timestamp"])
+        ts = df_logs.set_index("timestamp").resample("1H").size().reset_index(name="count")
+        
+        fig_line = px.line(ts, x="timestamp", y="count", markers=True)
+        st.plotly_chart(fig_line, use_container_width=True)
 
 # --------------------------------------------------
 st.caption(
-    "Modules Implemented: Module 3.5 (Hybrid Query Engine) • "
+    "System Status: Online • Modules Implemented: Module 3.5 (Hybrid Query Engine) • "
     "Module 3.7 (Visualization) • Module 6 (Explainable Anomaly Detection)"
 )

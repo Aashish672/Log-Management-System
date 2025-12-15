@@ -8,6 +8,13 @@ import time
 import datetime
 import os
 
+# --- Configuration ---
+# How far back to look for "recent" activity (e.g., 60 minutes)
+TIME_WINDOW_MINUTES = 60 
+MODEL_CONTAMINATION = 0.05 
+# Correlation window: Group anomalies within X minutes of each other
+CORRELATION_WINDOW_MINUTES = 15
+
 # --- Database Connection ---
 try:
     mongo_uri = settings.MONGODB_URI
@@ -16,24 +23,89 @@ try:
     client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
     db = client[db_name]
     templates_collection = db["templates"]
+    logs_collection = db["logs"] 
     anomalies_collection = db["anomalies"]
+    incidents_collection = db["incidents"] # New collection for correlated incidents
     client.server_info() 
     print("✅ Anomaly Detector connected to MongoDB.")
 except Exception as e:
     print(f"❌ Anomaly Detector failed to connect to MongoDB: {e}")
-    # In a real deployment, we might want to retry loop here
 
-# --- Model Configuration ---
-# Isolation Forest is effective for high-dimensional anomaly detection
-# Contamination is the expected proportion of outliers in the dataset
-MODEL_CONTAMINATION = 0.05 
-model = IsolationForest(n_estimators=100, contamination=MODEL_CONTAMINATION, random_state=42)
+# --- Model ---
+model = IsolationForest(n_estimators=200, contamination=MODEL_CONTAMINATION, random_state=42)
+
+def classify_severity(score, frequency):
+    """
+    Maps the anomaly score (lower is more anomalous) AND frequency to a severity level.
+    High frequency anomalies are often more critical (bursts).
+    """
+    # Base severity from score
+    if score < -0.20:
+        base_severity = 3 # Critical
+    elif score < -0.10:
+        base_severity = 2 # High
+    else:
+        base_severity = 1 # Medium
+    
+    # Boost severity if frequency is very high (potential DDoS or cascading failure)
+    if frequency > 1000:
+        base_severity = max(base_severity, 3)
+    elif frequency > 500:
+        base_severity = max(base_severity, 2)
+        
+    severity_map = {1: "MEDIUM", 2: "HIGH", 3: "CRITICAL"}
+    return severity_map.get(base_severity, "MEDIUM")
+
+def get_recent_frequencies(template_id):
+    """
+    Query real log activity for a template in time windows (1h and 24h).
+    """
+    now = datetime.datetime.utcnow()
+    last_1h = now - datetime.timedelta(hours=1)
+    last_24h = now - datetime.timedelta(hours=24)
+
+    freq_1h = logs_collection.count_documents({
+        "template_id": template_id,
+        "timestamp": {"$gte": last_1h}
+    })
+
+    freq_24h = logs_collection.count_documents({
+        "template_id": template_id,
+        "timestamp": {"$gte": last_24h}
+    })
+
+    return freq_1h, freq_24h
+
+def engineer_features(df):
+    """
+    Engineers features using REAL historical data vs. recent activity.
+    """
+    feature_rows = []
+    
+    for _, row in df.iterrows():
+        template_id = row["_id"] 
+        freq_total = row.get("frequency", 0)
+
+        freq_1h, freq_24h = get_recent_frequencies(template_id)
+
+        avg_hourly = max(freq_24h / 24, 1)
+        burst_ratio = freq_1h / avg_hourly
+
+        feature_rows.append({
+            "frequency_log": np.log1p(freq_total),
+            "burst_ratio": burst_ratio,
+            "freq_1h": freq_1h, 
+            "freq_24h": freq_24h
+        })
+
+    features_df = pd.DataFrame(feature_rows)
+    feature_cols = ["frequency_log", "burst_ratio"]
+    
+    df_enriched = pd.concat([df.reset_index(drop=True), features_df], axis=1)
+    
+    return df_enriched, features_df[feature_cols], feature_cols
 
 def get_data_and_features():
-    """
-    Fetches all template data from MongoDB and engineers advanced features.
-    Training on existing data ensures the model learns historical baselines.
-    """
     templates = list(templates_collection.find())
     
     if len(templates) < 5: 
@@ -41,137 +113,164 @@ def get_data_and_features():
         return None, None, None
 
     df = pd.DataFrame(templates)
-    
-    # --- Advanced Feature Engineering ---
-    
-    # 1. Log Frequency (Primary Feature)
-    # We log-transform to handle skewness (power law distribution of logs)
-    if 'frequency' not in df.columns:
-        df['frequency'] = 0
-    df['frequency_log'] = np.log1p(df['frequency']) 
-    
-    # 2. Burstiness / Recent Activity (Simulated for this demo)
-    # In a real production system, we would query the time-series logs to calculate this.
-    # For now, we can infer 'volatility' if the frequency is extremely high relative to others.
-    # (Here we just use frequency_log as the main feature for SHAP to explain)
-    
-    # Select features for the model
-    feature_cols = ['frequency_log']
-    features = df[feature_cols]
-    
+    df, features, feature_cols = engineer_features(df)
     return df, features, feature_cols
 
-def generate_shap_explanation(model, features_data, anomalous_row_idx):
-    """
-    Uses SHAP (SHapley Additive exPlanations) to explain WHY a specific row is an anomaly.
-    Returns a text explanation of the top contributing features.
-    """
+def generate_shap_explanation(model, features, idx):
     try:
-        # Create a SHAP explainer for the Isolation Forest model
         explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(features_data)
-        
-        # Get SHAP values for the specific anomalous row
-        # shap_values is a list of arrays (one for each class), or just an array for regression/IF
-        # For Isolation Forest in newer sklearn/shap versions, it might just be the array.
-        if isinstance(shap_values, list):
-             row_shap = shap_values[0][anomalous_row_idx]
-        else:
-             row_shap = shap_values[anomalous_row_idx]
+        shap_values = explainer.shap_values(features)
+        row_shap = shap_values[idx] if not isinstance(shap_values, list) else shap_values[0][idx]
 
-        feature_names = features_data.columns
-        
-        # Sort features by their absolute contribution to the anomaly score
-        # In Isolation Forest, lower score = more anomalous. 
-        # SHAP values indicate direction. Negative SHAP pushes towards anomaly.
-        
-        # We want to find features that pushed the score LOWER (more anomalous)
-        sorted_indices = np.argsort(row_shap) # Ascending order (most negative first)
-        
-        top_feature_idx = sorted_indices[0]
-        top_feature_name = feature_names[top_feature_idx]
-        top_shap_val = row_shap[top_feature_idx]
-        
-        # Generate human-readable text based on the feature
-        explanation = f"SHAP Analysis: The feature '{top_feature_name}' contributed most significantly ({top_shap_val:.2f}) to this anomaly."
-        
-        if top_feature_name == 'frequency_log':
-             raw_val = np.expm1(features_data.iloc[anomalous_row_idx][top_feature_name])
-             explanation += f" The frequency ({int(raw_val)}) is statistically highly unusual compared to the baseline."
-             
+        feature_names = features.columns
+        top_features = sorted(zip(feature_names, row_shap), key=lambda x: abs(x[1]), reverse=True)[:2]
+
+        explanation = "SHAP Analysis: "
+        explanation += ", ".join([f"Feature '{f}' impact ({v:.2f})" for f, v in top_features])
         return explanation
-
     except Exception as e:
-        print(f"SHAP explanation failed: {e}")
-        return "Statistical outlier detected by Isolation Forest (SHAP generation skipped)."
+        print(f"SHAP Error: {e}")
+        return "Statistical outlier (SHAP calculation failed)"
 
-def detect_and_store_anomalies():
+def correlate_incidents(new_anomalies):
     """
-    Main function to run the detection pipeline with SHAP explanations.
+    Groups new anomalies into 'Incidents' based on time proximity.
     """
-    print("🧠 Running intelligent anomaly detection cycle...")
-    df, features, feature_cols = get_data_and_features()
-    
-    if df is None:
+    if not new_anomalies:
         return
 
-    # 1. Train the model on ALL existing data
-    # This "retraining" approach allows the model to adapt to new normal patterns over time.
-    model.fit(features)
+    now = datetime.datetime.utcnow()
+    window_start = now - datetime.timedelta(minutes=CORRELATION_WINDOW_MINUTES)
     
-    # 2. Predict anomalies
-    df['anomaly_score'] = model.decision_function(features)
-    df['is_anomaly'] = model.predict(features) == -1 # -1 means anomaly
-
-    anomalies = df[df['is_anomaly']]
-    print(f"✅ Cycle complete. Scanned {len(df)} templates. Found {len(anomalies)} anomalies.")
-
-    # 3. Explain and Store Anomalies
-    if not anomalies.empty:
-        # Pre-compute SHAP explainer once for efficiency if needed, 
-        # but creating it per batch is fine for this scale.
+    # 1. Find existing active incidents in the window
+    active_incidents = list(incidents_collection.find({
+        "last_updated": {"$gte": window_start},
+        "status": "OPEN"
+    }))
+    
+    # 2. Try to map new anomalies to active incidents
+    # Simple logic: If an open incident exists, append to it. If not, create new.
+    # Ideally, you'd match by Service Name, but Template ID is our main key here.
+    
+    current_incident_id = None
+    
+    if active_incidents:
+        # Append to the most recent active incident
+        current_incident = active_incidents[0]
+        current_incident_id = current_incident["_id"]
         
-        for idx, row in anomalies.iterrows():
+        incidents_collection.update_one(
+            {"_id": current_incident_id},
+            {
+                "$push": {"anomalies": {"$each": new_anomalies}},
+                "$set": {
+                    "last_updated": now, 
+                    "anomaly_count": current_incident["anomaly_count"] + len(new_anomalies),
+                    # Upgrade severity if we see critical anomalies
+                    "severity": "CRITICAL" if any(a['severity'] == 'CRITICAL' for a in new_anomalies) else current_incident["severity"]
+                }
+            }
+        )
+        print(f"🔗 Correlated {len(new_anomalies)} anomalies to Incident {current_incident_id}")
+        
+    else:
+        # Create new incident
+        # Only create incident if we have High/Critical anomalies
+        criticality = [a['severity'] for a in new_anomalies]
+        highest_severity = "CRITICAL" if "CRITICAL" in criticality else ("HIGH" if "HIGH" in criticality else "MEDIUM")
+        
+        new_incident = {
+            "created_at": now,
+            "last_updated": now,
+            "status": "OPEN",
+            "severity": highest_severity,
+            "anomalies": new_anomalies,
+            "anomaly_count": len(new_anomalies),
+            "title": f"Incident: Burst of {len(new_anomalies)} anomalies detected"
+        }
+        res = incidents_collection.insert_one(new_incident)
+        print(f"🆕 Created new Incident {res.inserted_id} with severity {highest_severity}")
+
+def detect_and_store_anomalies():
+    print("🧠 Running intelligent anomaly detection cycle...")
+    
+    result = get_data_and_features()
+    if result is None: return
+
+    df, features, feature_cols = result
+
+    # 1. Train & Predict
+    model.fit(features)
+    df['anomaly_score'] = model.decision_function(features)
+    df['is_anomaly'] = model.predict(features) == -1 
+    
+    # 2. Classify Severity
+    df["severity"] = df.apply(lambda x: classify_severity(x['anomaly_score'], x['freq_1h']), axis=1)
+    
+    anomalies_df = df[df['is_anomaly']]
+    print(f"✅ Cycle complete. Found {len(anomalies_df)} anomalies.")
+
+    # 3. Store Individual Anomalies & Prepare for Correlation
+    new_anomaly_records = []
+    
+    if not anomalies_df.empty:
+        for idx, row in anomalies_df.iterrows():
             template_id = row['_id'] 
-            
-            # Generate SHAP explanation for this specific anomaly
-            # We pass the index of the row relative to the 'features' dataframe
-            shap_explanation = generate_shap_explanation(model, features, idx)
-            
+            shap_ex = generate_shap_explanation(model, features, idx)
+            MODEL_METADATA = {
+                "model": "IsolationForest",
+                "version": "IF_v2.1",
+                "features": ["frequency_log", "burst_ratio"],
+                "time_window_minutes": TIME_WINDOW_MINUTES,
+                "trained_on_samples": len(df),
+                "contamination": MODEL_CONTAMINATION
+            }
             alert_doc = {
                 "_id": template_id,
                 "template_string": row.get('template_string', 'Unknown'),
                 "frequency": int(row['frequency']),
+                "recent_frequency": int(row['freq_1h']), 
                 "anomaly_score": float(row['anomaly_score']),
-                "explanation": shap_explanation,
-                "model_version": "IsolationForest_v1",
+                "severity": row["severity"],
+                "explanation": shap_ex,
+                
+                # --- INCLUDE IT IN THE DOCUMENT ---
+                "model_metadata": MODEL_METADATA, 
+                # ----------------------------------
+                
                 "last_detected": datetime.datetime.utcnow()
             }
             
+            # Upsert individual alert
             anomalies_collection.update_one(
                 {"_id": template_id},
                 {"$set": alert_doc},
                 upsert=True
             )
-        print(f"💾 Saved {len(anomalies)} intelligent alerts to MongoDB.")
+            
+            # Prepare record for Incident Correlation (flattened)
+            new_anomaly_records.append({
+                "template_id": template_id,
+                "template_string": row.get('template_string', 'Unknown'),
+                "severity": row["severity"],
+                "score": float(row['anomaly_score']),
+                "timestamp": datetime.datetime.utcnow()
+            })
+            
+        # 4. Run Correlation Logic
+        # Only correlate High/Critical anomalies to avoid noise
+        important_anomalies = [a for a in new_anomaly_records if a['severity'] in ['HIGH', 'CRITICAL']]
+        if important_anomalies:
+            correlate_incidents(important_anomalies)
 
 def run_engine():
-    """
-    Runs the intelligent anomaly detector loop.
-    """
-    print("🚀 Intelligent Anomaly Engine Started (with SHAP Explainability).")
-    
-    try:
-        detect_and_store_anomalies()
-    except Exception as e:
-        print(f"❌ Error in initial detection cycle: {e}")
-
+    print("🚀 Intelligent Anomaly Engine Started (Real-Time + Correlation).")
     while True:
-        time.sleep(60)
         try:
             detect_and_store_anomalies()
         except Exception as e:
             print(f"❌ Error in detection cycle: {e}")
+        time.sleep(60)
 
 if __name__ == "__main__":
     run_engine()
