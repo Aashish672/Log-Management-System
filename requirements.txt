@@ -5,3 +5,5 @@ motor  # Async driver for FastAPI
 streamlit
 pandas
 pymongo # Sync driver for Streamlit
+plotly
+shap
