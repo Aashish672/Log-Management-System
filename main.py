@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from app.api.endpoints.logs import router as log_router
 from app.core.config import settings
 from app.core.database import db  # your Motor client
+from app.core.database import create_indexes
 
 app = FastAPI(
     title="Cloud Log Management System – Ingestion, Template Extraction & Compression",
@@ -18,6 +19,7 @@ app.include_router(log_router, prefix="/logs", tags=["Log Pipeline"])
 @app.on_event("startup")
 async def startup_event():
     # Print MongoDB URI and database
+    await create_indexes()
     print("🧠 Connected to MONGODB",)
     print("🗄️ Using database")
     # Test MongoDB connection

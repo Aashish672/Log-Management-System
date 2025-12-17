@@ -273,4 +273,5 @@ def run_engine():
         time.sleep(60)
 
 if __name__ == "__main__":
-    run_engine()
+    #run_engine()
+    detect_and_store_anomalies()
